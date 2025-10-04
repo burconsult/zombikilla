@@ -1,0 +1,15 @@
+# Copy this file to `config.toml` to customize the monitored ports.
+# Each entry can be a single port ("3000") or a range ("3000-3010").
+ports = [
+  "3000-3010",
+  "4200",
+  "4300-4399",
+  "5173",
+  "7000-7010",
+  "8000",
+  "8080",
+  "9000"
+]
+
+# Polling interval in seconds. Defaults to 2 seconds if omitted.
+poll_interval_secs = 2

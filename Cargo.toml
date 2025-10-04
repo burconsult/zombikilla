@@ -8,9 +8,9 @@ anyhow = "1"
 crossbeam-channel = "0.5"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-tray-icon = { version = "0.10", features = ["winit"] }
-winit = "0.28"
-nix = { version = "0.27", features = ["signal"] }
+tray-icon = "0.19"
+winit = "0.29"
+nix = { version = "0.29", features = ["signal"] }
 thiserror = "1"
 log = "0.4"
 env_logger = "0.11"

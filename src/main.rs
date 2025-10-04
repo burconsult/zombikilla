@@ -1,3 +1,24 @@
+//! # zombikilla
+//!
+//! A macOS status bar utility that monitors development ports and helps terminate
+//! stray processes that keep your ports busy.
+//!
+//! ## Architecture
+//!
+//! The application uses a multi-threaded architecture:
+//! - **Scanner Thread**: Periodically scans configured ports using `lsof`
+//! - **Killer Thread**: Handles process termination requests (SIGTERM then SIGKILL)
+//! - **Menu Listener Thread**: Listens for menu item clicks from the system tray
+//! - **Main Event Loop**: Manages the tray icon and coordinates between threads
+//!
+//! ## Configuration
+//!
+//! The app looks for `config.toml` in:
+//! 1. Current working directory
+//! 2. Directory containing the executable
+//!
+//! If no config is found, it uses sensible defaults for common development ports.
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -6,17 +27,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossbeam_channel::{unbounded, Receiver};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use log::{info, warn};
 use nix::errno::Errno;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use serde::Deserialize;
 use thiserror::Error;
-use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItemAttributes, PredefinedMenuItem};
+use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 use winit::event::{Event, StartCause};
-use winit::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
+use winit::event_loop::{EventLoop, EventLoopBuilder, EventLoopWindowTarget};
 
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 2;
 const DEFAULT_PORT_SPECS: &[&str] = &[
@@ -61,10 +82,12 @@ impl Config {
 
         for path in candidates {
             if path.exists() {
-                let contents = fs::read_to_string(&path)
-                    .with_context(|| format!("Failed to read configuration from {}", path.display()))?;
-                let config: Config = toml::from_str(&contents)
-                    .with_context(|| format!("Failed to parse configuration at {}", path.display()))?;
+                let contents = fs::read_to_string(&path).with_context(|| {
+                    format!("Failed to read configuration from {}", path.display())
+                })?;
+                let config: Config = toml::from_str(&contents).with_context(|| {
+                    format!("Failed to parse configuration at {}", path.display())
+                })?;
                 info!("Loaded configuration from {}", path.display());
                 return Ok(config);
             }
@@ -74,7 +97,10 @@ impl Config {
     }
 
     fn poll_interval(&self) -> Duration {
-        Duration::from_secs(self.poll_interval_secs.unwrap_or(DEFAULT_POLL_INTERVAL_SECS))
+        Duration::from_secs(
+            self.poll_interval_secs
+                .unwrap_or(DEFAULT_POLL_INTERVAL_SECS),
+        )
     }
 
     fn resolved_ports(&self) -> Vec<u16> {
@@ -91,6 +117,20 @@ impl Config {
     }
 }
 
+/// Parses a port specification string into a list of port numbers.
+///
+/// Supports both single ports ("8080") and ranges ("3000-3010").
+///
+/// # Examples
+///
+/// ```
+/// # use zombikilla_app::parse_port_entry;
+/// let ports = parse_port_entry("8080").unwrap();
+/// assert_eq!(ports, vec![8080]);
+///
+/// let range = parse_port_entry("3000-3002").unwrap();
+/// assert_eq!(range, vec![3000, 3001, 3002]);
+/// ```
 fn parse_port_entry(entry: &str) -> Result<Vec<u16>> {
     let trimmed = entry.trim();
     if trimmed.is_empty() {
@@ -141,6 +181,7 @@ enum AppEvent {
     ProcessUpdate(ProcessSnapshot),
     StatusMessage(String),
     MenuSelected(MenuId),
+    #[allow(dead_code)]
     Exit,
 }
 
@@ -150,58 +191,86 @@ enum KillCommand {
     KillAll(Vec<ProcessInfo>),
 }
 
-#[derive(Debug)]
 struct AppState {
-    tray_icon: TrayIcon,
-    menu: Menu,
+    tray_icon: Option<TrayIcon>,
+    menu: Option<Menu>,
     kill_all_id: MenuId,
     quit_id: MenuId,
     process_items: HashMap<MenuId, ProcessInfo>,
     processes: Vec<ProcessInfo>,
     last_status_message: Option<String>,
+    kill_tx: Sender<KillCommand>,
+    event_rx: Receiver<AppEvent>,
+    should_exit: bool,
 }
 
 impl AppState {
-    fn new(mut tray_icon: TrayIcon, mut menu: Menu, kill_all_id: MenuId, quit_id: MenuId) -> Self {
-        tray_icon.set_title(Some("0".to_string()));
-        tray_icon.set_tooltip(Some("No listening dev servers detected.".into()));
-        menu.add_item(MenuItemAttributes::new("Kill All Processes").with_id(kill_all_id.clone()).with_enabled(false));
-        menu.add_native_item(PredefinedMenuItem::separator());
-        menu.add_item(MenuItemAttributes::new("Quit").with_id(quit_id.clone()));
+    fn new(
+        kill_all_id: MenuId,
+        quit_id: MenuId,
+        kill_tx: Sender<KillCommand>,
+        event_rx: Receiver<AppEvent>,
+    ) -> Self {
         AppState {
-            tray_icon,
-            menu,
+            tray_icon: None,
+            menu: None,
             kill_all_id,
             quit_id,
             process_items: HashMap::new(),
             processes: Vec::new(),
             last_status_message: None,
+            kill_tx,
+            event_rx,
+            should_exit: false,
         }
     }
 
-    fn update_processes(&mut self, processes: Vec<ProcessInfo>) {
+    fn initialize_tray(&mut self) -> Result<()> {
+        let menu = Menu::new();
+        let kill_all_item =
+            MenuItem::with_id(self.kill_all_id.clone(), "Kill All Processes", false, None);
+        menu.append(&kill_all_item)?;
+        menu.append(&PredefinedMenuItem::separator())?;
+        let quit_item = MenuItem::with_id(self.quit_id.clone(), "Quit", true, None);
+        menu.append(&quit_item)?;
+
+        let tray_icon = TrayIconBuilder::new()
+            .with_menu(Box::new(menu.clone()))
+            .with_title("0")
+            .with_tooltip("No listening dev servers detected.")
+            .build()
+            .context("Failed to create tray icon")?;
+
+        self.tray_icon = Some(tray_icon);
+        self.menu = Some(menu);
+        Ok(())
+    }
+
+    fn update_processes(&mut self, processes: Vec<ProcessInfo>) -> Result<()> {
         self.processes = processes;
-        self.rebuild_menu();
-        self.refresh_icon_text();
+        self.rebuild_menu()?;
+        self.refresh_icon_text()
     }
 
-    fn set_status_message(&mut self, message: Option<String>) {
+    fn set_status_message(&mut self, message: Option<String>) -> Result<()> {
         self.last_status_message = message;
-        self.refresh_tooltip();
+        self.refresh_tooltip()
     }
 
-    fn refresh_icon_text(&mut self) {
+    fn refresh_icon_text(&mut self) -> Result<()> {
         let count = self.processes.len();
         let title = if count == 0 {
             "0".to_string()
         } else {
             format!("{}⚠️", count)
         };
-        let _ = self.tray_icon.set_title(Some(title));
-        self.refresh_tooltip();
+        if let Some(tray_icon) = &mut self.tray_icon {
+            tray_icon.set_title(Some(title));
+        }
+        self.refresh_tooltip()
     }
 
-    fn refresh_tooltip(&mut self) {
+    fn refresh_tooltip(&mut self) -> Result<()> {
         let mut lines: Vec<String> = Vec::new();
         if let Some(message) = &self.last_status_message {
             lines.push(message.clone());
@@ -211,43 +280,147 @@ impl AppState {
         } else {
             lines.push("Active listeners:".into());
             for process in &self.processes {
-                lines.push(format!("Port {}: {} (PID {})", process.port, process.command, process.pid));
+                lines.push(format!(
+                    "Port {}: {} (PID {})",
+                    process.port, process.command, process.pid
+                ));
             }
         }
         let tooltip = lines.join("\n");
-        let _ = self.tray_icon.set_tooltip(Some(tooltip));
+        if let Some(tray_icon) = &mut self.tray_icon {
+            let _ = tray_icon.set_tooltip(Some(tooltip));
+        }
+        Ok(())
     }
 
-    fn rebuild_menu(&mut self) {
-        let mut new_menu = Menu::new();
+    fn rebuild_menu(&mut self) -> Result<()> {
+        let new_menu = Menu::new();
         let has_processes = !self.processes.is_empty();
-        new_menu.add_item(
-            MenuItemAttributes::new("Kill All Processes")
-                .with_id(self.kill_all_id.clone())
-                .with_enabled(has_processes),
+
+        let kill_all_item = MenuItem::with_id(
+            self.kill_all_id.clone(),
+            "Kill All Processes",
+            has_processes,
+            None,
         );
-        new_menu.add_native_item(PredefinedMenuItem::separator());
+        new_menu.append(&kill_all_item)?;
+        new_menu.append(&PredefinedMenuItem::separator())?;
 
         self.process_items.clear();
         for process in &self.processes {
             let id = MenuId::new(format!("process_{}", process.pid));
-            let label = format!("Kill: Port {}: {} (PID {})", process.port, process.command, process.pid);
-            new_menu.add_item(MenuItemAttributes::new(label).with_id(id.clone()));
+            let label = format!(
+                "Kill: Port {}: {} (PID {})",
+                process.port, process.command, process.pid
+            );
+            let item = MenuItem::with_id(id.clone(), label, true, None);
+            new_menu.append(&item)?;
             self.process_items.insert(id, process.clone());
         }
 
         if has_processes {
-            new_menu.add_native_item(PredefinedMenuItem::separator());
+            new_menu.append(&PredefinedMenuItem::separator())?;
         }
 
-        new_menu.add_item(MenuItemAttributes::new("Quit").with_id(self.quit_id.clone()));
-        self.menu = new_menu.clone();
-        let _ = self.tray_icon.set_menu(Some(new_menu));
-        self.refresh_tooltip();
+        let quit_item = MenuItem::with_id(self.quit_id.clone(), "Quit", true, None);
+        new_menu.append(&quit_item)?;
+
+        if let Some(tray_icon) = &mut self.tray_icon {
+            tray_icon.set_menu(Some(Box::new(new_menu.clone())));
+        }
+        self.menu = Some(new_menu);
+        self.refresh_tooltip()?;
+        Ok(())
     }
 
     fn take_process_for_id(&self, id: &MenuId) -> Option<ProcessInfo> {
         self.process_items.get(id).cloned()
+    }
+
+    fn handle_menu_event(&mut self, id: MenuId) -> Result<()> {
+        if id == self.quit_id {
+            info!("Quit selected");
+            self.should_exit = true;
+        } else if id == self.kill_all_id {
+            if !self.processes.is_empty() {
+                let _ = self
+                    .kill_tx
+                    .send(KillCommand::KillAll(self.processes.clone()));
+                self.set_status_message(Some("Killing all tracked processes".into()))?;
+            }
+        } else if let Some(process) = self.take_process_for_id(&id) {
+            let _ = self.kill_tx.send(KillCommand::KillProcess(process.clone()));
+            self.set_status_message(Some(format!(
+                "Sent termination signal to PID {} on port {}",
+                process.pid, process.port
+            )))?;
+        }
+        Ok(())
+    }
+
+    fn process_events(&mut self) -> Result<()> {
+        while let Ok(event) = self.event_rx.try_recv() {
+            match event {
+                AppEvent::ProcessUpdate(snapshot) => {
+                    self.update_processes(snapshot.processes)?;
+                }
+                AppEvent::StatusMessage(message) => {
+                    self.set_status_message(Some(message))?;
+                }
+                AppEvent::MenuSelected(id) => {
+                    self.handle_menu_event(id)?;
+                }
+                AppEvent::Exit => {
+                    self.should_exit = true;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl AppState {
+    fn handle_event(&mut self, event: Event<AppEvent>, elwt: &EventLoopWindowTarget<AppEvent>) {
+        match event {
+            Event::NewEvents(StartCause::Init) => {
+                if let Err(e) = self.initialize_tray() {
+                    warn!("Failed to initialize tray icon: {}", e);
+                    self.should_exit = true;
+                } else {
+                    info!("Tray icon initialized successfully");
+                }
+            }
+            Event::UserEvent(app_event) => match app_event {
+                AppEvent::ProcessUpdate(snapshot) => {
+                    if let Err(e) = self.update_processes(snapshot.processes) {
+                        warn!("Failed to update processes: {}", e);
+                    }
+                }
+                AppEvent::StatusMessage(message) => {
+                    if let Err(e) = self.set_status_message(Some(message)) {
+                        warn!("Failed to set status message: {}", e);
+                    }
+                }
+                AppEvent::MenuSelected(id) => {
+                    if let Err(e) = self.handle_menu_event(id) {
+                        warn!("Failed to handle menu event: {}", e);
+                    }
+                }
+                AppEvent::Exit => {
+                    self.should_exit = true;
+                }
+            },
+            Event::AboutToWait => {
+                if let Err(e) = self.process_events() {
+                    warn!("Error processing events: {}", e);
+                }
+            }
+            _ => {}
+        }
+
+        if self.should_exit {
+            elwt.exit();
+        }
     }
 }
 
@@ -256,7 +429,11 @@ enum KillError {
     #[error("Permission denied when signaling PID {pid}")]
     PermissionDenied { pid: i32 },
     #[error("Failed to signal PID {pid}: {source}")]
-    SignalFailure { pid: i32, #[source] source: nix::Error },
+    SignalFailure {
+        pid: i32,
+        #[source]
+        source: Errno,
+    },
 }
 
 #[derive(Debug)]
@@ -270,71 +447,34 @@ fn main() -> Result<()> {
     env_logger::init();
 
     let config = Config::load()?;
-    let event_loop: EventLoop<AppEvent> = EventLoopBuilder::with_user_event().build();
+    let event_loop: EventLoop<AppEvent> = EventLoopBuilder::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
 
-    let kill_all_id = MenuId::new("kill_all".to_string());
-    let quit_id = MenuId::new("quit".to_string());
-
-    let menu = Menu::new();
-    let tray_icon = TrayIconBuilder::new()
-        .with_menu(menu.clone())
-        .with_title("0")
-        .with_tooltip("No listening dev servers detected.")
-        .build()
-        .context("Failed to create tray icon")?;
-
-    let mut app_state = AppState::new(tray_icon, menu, kill_all_id.clone(), quit_id.clone());
+    let kill_all_id = MenuId::new("kill_all");
+    let quit_id = MenuId::new("quit");
 
     let (kill_tx, kill_rx) = unbounded::<KillCommand>();
+    let (event_tx, event_rx) = unbounded::<AppEvent>();
 
-    spawn_scanner_thread(config.clone(), proxy.clone());
-    spawn_killer_thread(kill_rx, proxy.clone());
-    spawn_menu_listener(proxy.clone());
+    spawn_scanner_thread(config.clone(), proxy.clone(), event_tx.clone());
+    spawn_killer_thread(kill_rx, proxy.clone(), event_tx.clone());
+    spawn_menu_listener(proxy.clone(), event_tx);
 
-    let kill_sender = kill_tx.clone();
+    let mut app_state = AppState::new(kill_all_id, quit_id, kill_tx, event_rx);
 
-    event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
-        match event {
-            Event::NewEvents(StartCause::Init) => {
-                info!("Starting zombikilla tray application");
-            }
-            Event::UserEvent(AppEvent::ProcessUpdate(snapshot)) => {
-                app_state.update_processes(snapshot.processes);
-            }
-            Event::UserEvent(AppEvent::StatusMessage(message)) => {
-                app_state.set_status_message(Some(message));
-            }
-            Event::UserEvent(AppEvent::MenuSelected(id)) => {
-                if id == quit_id {
-                    info!("Quit selected");
-                    *control_flow = ControlFlow::Exit;
-                } else if id == kill_all_id {
-                    if !app_state.processes.is_empty() {
-                        let _ = kill_sender.send(KillCommand::KillAll(app_state.processes.clone()));
-                        app_state.set_status_message(Some("Killing all tracked processes".into()));
-                    }
-                } else if let Some(process) = app_state.take_process_for_id(&id) {
-                    let _ = kill_sender.send(KillCommand::KillProcess(process.clone()));
-                    app_state.set_status_message(Some(format!(
-                        "Sent termination signal to PID {} on port {}",
-                        process.pid, process.port
-                    )));
-                }
-            }
-            Event::UserEvent(AppEvent::Exit) => {
-                *control_flow = ControlFlow::Exit;
-            }
-            Event::LoopDestroyed => {
-                info!("Event loop destroyed");
-            }
-            _ => {}
-        }
-    });
+    event_loop.run(move |event, elwt| {
+        app_state.handle_event(event, elwt);
+    })?;
+
+    info!("Application exited cleanly");
+    Ok(())
 }
 
-fn spawn_scanner_thread(config: Config, proxy: EventLoopProxy<AppEvent>) {
+fn spawn_scanner_thread(
+    config: Config,
+    proxy: winit::event_loop::EventLoopProxy<AppEvent>,
+    event_tx: Sender<AppEvent>,
+) {
     thread::spawn(move || {
         let ports = config.resolved_ports();
         if ports.is_empty() {
@@ -343,7 +483,13 @@ fn spawn_scanner_thread(config: Config, proxy: EventLoopProxy<AppEvent>) {
         let interval = config.poll_interval();
         loop {
             let snapshot = scan_ports(&ports);
-            if proxy.send_event(AppEvent::ProcessUpdate(snapshot)).is_err() {
+            if proxy
+                .send_event(AppEvent::ProcessUpdate(snapshot.clone()))
+                .is_err()
+            {
+                break;
+            }
+            if event_tx.send(AppEvent::ProcessUpdate(snapshot)).is_err() {
                 break;
             }
             thread::sleep(interval);
@@ -351,34 +497,36 @@ fn spawn_scanner_thread(config: Config, proxy: EventLoopProxy<AppEvent>) {
     });
 }
 
-fn spawn_killer_thread(kill_rx: Receiver<KillCommand>, proxy: EventLoopProxy<AppEvent>) {
+fn spawn_killer_thread(
+    kill_rx: Receiver<KillCommand>,
+    proxy: winit::event_loop::EventLoopProxy<AppEvent>,
+    event_tx: Sender<AppEvent>,
+) {
     thread::spawn(move || {
         while let Ok(command) = kill_rx.recv() {
             match command {
                 KillCommand::KillProcess(process) => match terminate_process(process.pid) {
                     Ok(result) => {
                         let message = match result {
-                            TerminationResult::AlreadyExited => format!(
-                                "Process PID {} was already stopped.",
-                                process.pid
-                            ),
+                            TerminationResult::AlreadyExited => {
+                                format!("Process PID {} was already stopped.", process.pid)
+                            }
                             TerminationResult::Graceful => format!(
                                 "Gracefully terminated PID {} (port {}).",
                                 process.pid, process.port
                             ),
-                            TerminationResult::Forced => format!(
-                                "Force killed PID {} (port {}).",
-                                process.pid, process.port
-                            ),
+                            TerminationResult::Forced => {
+                                format!("Force killed PID {} (port {}).", process.pid, process.port)
+                            }
                         };
-                        let _ = proxy.send_event(AppEvent::StatusMessage(message));
+                        let _ = proxy.send_event(AppEvent::StatusMessage(message.clone()));
+                        let _ = event_tx.send(AppEvent::StatusMessage(message));
                     }
                     Err(err) => {
                         warn!("Failed to kill PID {}: {}", process.pid, err);
-                        let _ = proxy.send_event(AppEvent::StatusMessage(format!(
-                            "Unable to terminate PID {}: {}",
-                            process.pid, err
-                        )));
+                        let message = format!("Unable to terminate PID {}: {}", process.pid, err);
+                        let _ = proxy.send_event(AppEvent::StatusMessage(message.clone()));
+                        let _ = event_tx.send(AppEvent::StatusMessage(message));
                     }
                 },
                 KillCommand::KillAll(processes) => {
@@ -386,10 +534,9 @@ fn spawn_killer_thread(kill_rx: Receiver<KillCommand>, proxy: EventLoopProxy<App
                         match terminate_process(process.pid) {
                             Ok(result) => {
                                 let message = match result {
-                                    TerminationResult::AlreadyExited => format!(
-                                        "Process PID {} was already stopped.",
-                                        process.pid
-                                    ),
+                                    TerminationResult::AlreadyExited => {
+                                        format!("Process PID {} was already stopped.", process.pid)
+                                    }
                                     TerminationResult::Graceful => format!(
                                         "Gracefully terminated PID {} (port {}).",
                                         process.pid, process.port
@@ -399,14 +546,15 @@ fn spawn_killer_thread(kill_rx: Receiver<KillCommand>, proxy: EventLoopProxy<App
                                         process.pid, process.port
                                     ),
                                 };
-                                let _ = proxy.send_event(AppEvent::StatusMessage(message));
+                                let _ = proxy.send_event(AppEvent::StatusMessage(message.clone()));
+                                let _ = event_tx.send(AppEvent::StatusMessage(message));
                             }
                             Err(err) => {
                                 warn!("Failed to kill PID {}: {}", process.pid, err);
-                                let _ = proxy.send_event(AppEvent::StatusMessage(format!(
-                                    "Unable to terminate PID {}: {}",
-                                    process.pid, err
-                                )));
+                                let message =
+                                    format!("Unable to terminate PID {}: {}", process.pid, err);
+                                let _ = proxy.send_event(AppEvent::StatusMessage(message.clone()));
+                                let _ = event_tx.send(AppEvent::StatusMessage(message));
                             }
                         }
                     }
@@ -416,11 +564,23 @@ fn spawn_killer_thread(kill_rx: Receiver<KillCommand>, proxy: EventLoopProxy<App
     });
 }
 
-fn spawn_menu_listener(proxy: EventLoopProxy<AppEvent>) {
+fn spawn_menu_listener(
+    proxy: winit::event_loop::EventLoopProxy<AppEvent>,
+    event_tx: Sender<AppEvent>,
+) {
     thread::spawn(move || {
         let receiver = MenuEvent::receiver();
         while let Ok(event) = receiver.recv() {
-            if proxy.send_event(AppEvent::MenuSelected(event.id.clone())).is_err() {
+            if proxy
+                .send_event(AppEvent::MenuSelected(event.id.clone()))
+                .is_err()
+            {
+                break;
+            }
+            if event_tx
+                .send(AppEvent::MenuSelected(event.id.clone()))
+                .is_err()
+            {
                 break;
             }
         }
@@ -453,6 +613,19 @@ fn scan_ports(ports: &[u16]) -> ProcessSnapshot {
     ProcessSnapshot { processes }
 }
 
+/// Scans a specific port for listening processes using `lsof`.
+///
+/// Executes `lsof -ti :PORT -sTCP:LISTEN` to find PIDs, then queries
+/// each process name using `ps`.
+///
+/// # Arguments
+///
+/// * `port` - The port number to scan
+///
+/// # Returns
+///
+/// A vector of `ProcessInfo` for all processes listening on the port.
+/// Returns an empty vector if no processes are found (lsof exit code 1).
 fn scan_port(port: u16) -> Result<Vec<ProcessInfo>> {
     let output = Command::new("lsof")
         .args(["-ti", &format!(":{}", port), "-sTCP:LISTEN"])
@@ -503,12 +676,28 @@ fn query_process_command(pid: i32) -> Option<String> {
     }
 }
 
+/// Attempts to terminate a process, first gracefully (SIGTERM) then forcefully (SIGKILL).
+///
+/// The function first sends SIGTERM and waits up to 3 seconds for the process to exit.
+/// If the process doesn't exit within this time, it sends SIGKILL.
+///
+/// # Arguments
+///
+/// * `pid` - The process ID to terminate
+///
+/// # Returns
+///
+/// * `Ok(TerminationResult::AlreadyExited)` - Process was already dead
+/// * `Ok(TerminationResult::Graceful)` - Process exited after SIGTERM
+/// * `Ok(TerminationResult::Forced)` - Process was killed with SIGKILL
+/// * `Err(KillError::PermissionDenied)` - Insufficient permissions
+/// * `Err(KillError::SignalFailure)` - Other signal error
 fn terminate_process(pid: i32) -> Result<TerminationResult, KillError> {
     let nix_pid = Pid::from_raw(pid);
     match kill(nix_pid, Some(Signal::SIGTERM)) {
         Ok(_) => {}
-        Err(nix::Error::Sys(Errno::ESRCH)) => return Ok(TerminationResult::AlreadyExited),
-        Err(nix::Error::Sys(Errno::EPERM)) => {
+        Err(Errno::ESRCH) => return Ok(TerminationResult::AlreadyExited),
+        Err(Errno::EPERM) => {
             return Err(KillError::PermissionDenied { pid });
         }
         Err(err) => {
@@ -524,10 +713,10 @@ fn terminate_process(pid: i32) -> Result<TerminationResult, KillError> {
                     break;
                 }
             }
-            Err(nix::Error::Sys(Errno::ESRCH)) => {
+            Err(Errno::ESRCH) => {
                 return Ok(TerminationResult::Graceful);
             }
-            Err(nix::Error::Sys(Errno::EPERM)) => {
+            Err(Errno::EPERM) => {
                 return Err(KillError::PermissionDenied { pid });
             }
             Err(err) => {
@@ -539,8 +728,85 @@ fn terminate_process(pid: i32) -> Result<TerminationResult, KillError> {
 
     match kill(nix_pid, Some(Signal::SIGKILL)) {
         Ok(_) => Ok(TerminationResult::Forced),
-        Err(nix::Error::Sys(Errno::ESRCH)) => Ok(TerminationResult::Graceful),
-        Err(nix::Error::Sys(Errno::EPERM)) => Err(KillError::PermissionDenied { pid }),
+        Err(Errno::ESRCH) => Ok(TerminationResult::Graceful),
+        Err(Errno::EPERM) => Err(KillError::PermissionDenied { pid }),
         Err(err) => Err(KillError::SignalFailure { pid, source: err }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_port_entry_single() {
+        let result = parse_port_entry("8080").unwrap();
+        assert_eq!(result, vec![8080]);
+    }
+
+    #[test]
+    fn test_parse_port_entry_range() {
+        let result = parse_port_entry("3000-3002").unwrap();
+        assert_eq!(result, vec![3000, 3001, 3002]);
+    }
+
+    #[test]
+    fn test_parse_port_entry_invalid_range() {
+        let result = parse_port_entry("5000-4000");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_port_entry_invalid_port() {
+        let result = parse_port_entry("not_a_port");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_port_entry_empty() {
+        let result = parse_port_entry("").unwrap();
+        assert_eq!(result, Vec::<u16>::new());
+    }
+
+    #[test]
+    fn test_config_resolved_ports_deduplication() {
+        let config = Config {
+            ports: vec![
+                "3000".to_string(),
+                "3000-3002".to_string(),
+                "3001".to_string(),
+            ],
+            poll_interval_secs: Some(2),
+        };
+        let ports = config.resolved_ports();
+        assert_eq!(ports, vec![3000, 3001, 3002]);
+    }
+
+    #[test]
+    fn test_config_default() {
+        let config = Config::default();
+        assert!(!config.ports.is_empty());
+        assert_eq!(config.poll_interval_secs, Some(DEFAULT_POLL_INTERVAL_SECS));
+    }
+
+    #[test]
+    fn test_config_poll_interval() {
+        let config = Config {
+            ports: vec![],
+            poll_interval_secs: Some(5),
+        };
+        assert_eq!(config.poll_interval(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_config_poll_interval_default() {
+        let config = Config {
+            ports: vec![],
+            poll_interval_secs: None,
+        };
+        assert_eq!(
+            config.poll_interval(),
+            Duration::from_secs(DEFAULT_POLL_INTERVAL_SECS)
+        );
     }
 }
